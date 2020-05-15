@@ -7,7 +7,7 @@ import { onUnexpectedError } from 'vs/base/common/errors';
 import { Emitter, Event } from 'vs/base/common/event';
 import * as strings from 'vs/base/common/strings';
 import { CursorCollection } from 'vs/editor/common/controller/cursorCollection';
-import { CursorColumns, CursorConfiguration, CursorContext, CursorState, EditOperationResult, EditOperationType, IColumnSelectData, ICursors, PartialCursorState, RevealTarget, IReducedViewModel } from 'vs/editor/common/controller/cursorCommon';
+import { CursorColumns, CursorConfiguration, CursorContext, CursorState, EditOperationResult, EditOperationType, IColumnSelectData, ICursors, PartialCursorState, RevealTarget, ICursorSimpleModel } from 'vs/editor/common/controller/cursorCommon';
 import { DeleteOperations } from 'vs/editor/common/controller/cursorDeleteOperations';
 import { CursorChangeReason } from 'vs/editor/common/controller/cursorEvents';
 import { TypeOperations, TypeWithAutoClosingCommand } from 'vs/editor/common/controller/cursorTypeOperations';
@@ -16,19 +16,11 @@ import { Range, IRange } from 'vs/editor/common/core/range';
 import { ISelection, Selection, SelectionDirection } from 'vs/editor/common/core/selection';
 import * as editorCommon from 'vs/editor/common/editorCommon';
 import { ITextModel, TrackedRangeStickiness, IModelDeltaDecoration, ICursorStateComputer, IIdentifiedSingleEditOperation, IValidEditOperation } from 'vs/editor/common/model';
-import { RawContentChangedType, ModelRawContentChangedEvent } from 'vs/editor/common/model/textModelEvents';
+import { RawContentChangedType, ModelRawContentChangedEvent, IModelLanguageChangedEvent } from 'vs/editor/common/model/textModelEvents';
 import * as viewEvents from 'vs/editor/common/view/viewEvents';
 import { dispose } from 'vs/base/common/lifecycle';
-import { EditorOption } from 'vs/editor/common/config/editorOptions';
-
-function containsLineMappingChanged(events: viewEvents.ViewEvent[]): boolean {
-	for (let i = 0, len = events.length; i < len; i++) {
-		if (events[i].type === viewEvents.ViewEventType.ViewLineMappingChanged) {
-			return true;
-		}
-	}
-	return false;
-}
+import { EditorOption, ConfigurationChangedEvent } from 'vs/editor/common/config/editorOptions';
+import { ICoordinatesConverter } from 'vs/editor/common/viewModel/viewModel';
 
 export class CursorStateChangedEvent {
 	/**
@@ -56,14 +48,19 @@ export class CursorStateChangedEvent {
 	 * Reason.
 	 */
 	readonly reason: CursorChangeReason;
+	/**
+	 * The number of cursors was limited because it has reached the maximum cursor count.
+	 */
+	readonly reachedMaxCursorCount: boolean;
 
-	constructor(selections: Selection[], modelVersionId: number, oldSelections: Selection[] | null, oldModelVersionId: number, source: string, reason: CursorChangeReason) {
+	constructor(selections: Selection[], modelVersionId: number, oldSelections: Selection[] | null, oldModelVersionId: number, source: string, reason: CursorChangeReason, reachedMaxCursorCount: boolean) {
 		this.selections = selections;
 		this.modelVersionId = modelVersionId;
 		this.oldSelections = oldSelections;
 		this.oldModelVersionId = oldModelVersionId;
 		this.source = source;
 		this.reason = reason;
+		this.reachedMaxCursorCount = reachedMaxCursorCount;
 	}
 }
 
@@ -169,9 +166,6 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 
 	public static readonly MAX_CURSOR_COUNT = 10000;
 
-	private readonly _onDidReachMaxCursorCount: Emitter<void> = this._register(new Emitter<void>());
-	public readonly onDidReachMaxCursorCount: Event<void> = this._onDidReachMaxCursorCount.event;
-
 	private readonly _onDidAttemptReadOnlyEdit: Emitter<void> = this._register(new Emitter<void>());
 	public readonly onDidAttemptReadOnlyEdit: Event<void> = this._onDidAttemptReadOnlyEdit.event;
 
@@ -181,7 +175,8 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 	private readonly _configuration: editorCommon.IConfiguration;
 	private readonly _model: ITextModel;
 	private _knownModelVersionId: number;
-	private readonly _viewModel: IReducedViewModel;
+	private readonly _viewModel: ICursorSimpleModel;
+	private readonly _coordinatesConverter: ICoordinatesConverter;
 	public context: CursorContext;
 	private _cursors: CursorCollection;
 
@@ -193,13 +188,14 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 	private _autoClosedActions: AutoClosedAction[];
 	private _prevEditOperationType: EditOperationType;
 
-	constructor(configuration: editorCommon.IConfiguration, model: ITextModel, viewModel: IReducedViewModel) {
+	constructor(configuration: editorCommon.IConfiguration, model: ITextModel, viewModel: ICursorSimpleModel, coordinatesConverter: ICoordinatesConverter) {
 		super();
 		this._configuration = configuration;
 		this._model = model;
 		this._knownModelVersionId = this._model.getVersionId();
 		this._viewModel = viewModel;
-		this.context = new CursorContext(this._configuration, this._model, this._viewModel);
+		this._coordinatesConverter = coordinatesConverter;
+		this.context = new CursorContext(this._configuration, this._model, this._viewModel, this._coordinatesConverter);
 		this._cursors = new CursorCollection(this.context);
 
 		this._hasFocus = false;
@@ -209,59 +205,50 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 		this._columnSelectData = null;
 		this._autoClosedActions = [];
 		this._prevEditOperationType = EditOperationType.Other;
-
-		this._register(this._model.onDidChangeRawContent((e) => {
-			this._knownModelVersionId = e.versionId;
-			if (this._isHandling) {
-				return;
-			}
-
-			this._onModelContentChanged(e);
-		}));
-
-		this._register(viewModel.addViewEventListener((events: viewEvents.ViewEvent[]) => {
-			if (!containsLineMappingChanged(events)) {
-				return;
-			}
-
-			if (this._knownModelVersionId !== this._model.getVersionId()) {
-				// There are model change events that I didn't yet receive.
-				//
-				// This can happen when editing the model, and the view model receives the change events first,
-				// and the view model emits line mapping changed events, all before the cursor gets a chance to
-				// recover from markers.
-				//
-				// The model change listener above will be called soon and we'll ensure a valid cursor state there.
-				return;
-			}
-			// Ensure valid state
-			this.setStates('viewModel', CursorChangeReason.NotSet, this.getAll());
-		}));
-
-		const updateCursorContext = () => {
-			this.context = new CursorContext(this._configuration, this._model, this._viewModel);
-			this._cursors.updateContext(this.context);
-		};
-		this._register(this._model.onDidChangeLanguage((e) => {
-			updateCursorContext();
-		}));
-		this._register(this._model.onDidChangeLanguageConfiguration(() => {
-			updateCursorContext();
-		}));
-		this._register(this._model.onDidChangeOptions(() => {
-			updateCursorContext();
-		}));
-		this._register(this._configuration.onDidChange((e) => {
-			if (CursorConfiguration.shouldRecreate(e)) {
-				updateCursorContext();
-			}
-		}));
 	}
 
 	public dispose(): void {
 		this._cursors.dispose();
 		this._autoClosedActions = dispose(this._autoClosedActions);
 		super.dispose();
+	}
+
+	private _updateCursorContext(): void {
+		this.context = new CursorContext(this._configuration, this._model, this._viewModel, this._coordinatesConverter);
+		this._cursors.updateContext(this.context);
+	}
+
+	public onLineMappingChanged(): void {
+		if (this._knownModelVersionId !== this._model.getVersionId()) {
+			// There are model change events that I didn't yet receive.
+			//
+			// This can happen when editing the model, and the view model receives the change events first,
+			// and the view model emits line mapping changed events, all before the cursor gets a chance to
+			// recover from markers.
+			//
+			// The model change listener above will be called soon and we'll ensure a valid cursor state there.
+			return;
+		}
+		// Ensure valid state
+		this.setStates('viewModel', CursorChangeReason.NotSet, this.getAll());
+	}
+
+	public onDidChangeModelLanguage(e: IModelLanguageChangedEvent): void {
+		this._updateCursorContext();
+	}
+
+	public onDidChangeModelLanguageConfiguration(): void {
+		this._updateCursorContext();
+	}
+
+	public onDidChangeModelOptions(): void {
+		this._updateCursorContext();
+	}
+
+	public onDidChangeConfiguration(e: ConfigurationChangedEvent): void {
+		if (CursorConfiguration.shouldRecreate(e)) {
+			this._updateCursorContext();
+		}
 	}
 
 	public setHasFocus(hasFocus: boolean): void {
@@ -297,9 +284,10 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 	}
 
 	public setStates(source: string | null | undefined, reason: CursorChangeReason, states: PartialCursorState[] | null): boolean {
+		let reachedMaxCursorCount = false;
 		if (states !== null && states.length > Cursor.MAX_CURSOR_COUNT) {
 			states = states.slice(0, Cursor.MAX_CURSOR_COUNT);
-			this._onDidReachMaxCursorCount.fire(undefined);
+			reachedMaxCursorCount = true;
 		}
 
 		const oldState = new CursorModelState(this._model, this);
@@ -310,7 +298,7 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 
 		this._validateAutoClosedActions();
 
-		return this._emitStateChangedIfNecessary(source, reason, oldState);
+		return this._emitStateChangedIfNecessary(source, reason, oldState, reachedMaxCursorCount);
 	}
 
 	public setColumnSelectData(columnSelectData: IColumnSelectData): void {
@@ -390,7 +378,12 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 		this.reveal('restoreState', true, RevealTarget.Primary, editorCommon.ScrollType.Immediate);
 	}
 
-	private _onModelContentChanged(e: ModelRawContentChangedEvent): void {
+	public onModelContentChanged(e: ModelRawContentChangedEvent): void {
+
+		this._knownModelVersionId = e.versionId;
+		if (this._isHandling) {
+			return;
+		}
 
 		const hadFlushEvent = e.containsEvent(RawContentChangedType.Flush);
 		this._prevEditOperationType = EditOperationType.Other;
@@ -400,7 +393,7 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 			this._cursors.dispose();
 			this._cursors = new CursorCollection(this.context);
 			this._validateAutoClosedActions();
-			this._emitStateChangedIfNecessary('model', CursorChangeReason.ContentFlush, null);
+			this._emitStateChangedIfNecessary('model', CursorChangeReason.ContentFlush, null, false);
 		} else {
 			if (this._hasFocus && e.resultingSelection && e.resultingSelection.length > 0) {
 				const cursorState = CursorState.fromModelSelections(e.resultingSelection);
@@ -436,10 +429,6 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 
 	public getSelections(): Selection[] {
 		return this._cursors.getSelections();
-	}
-
-	public getViewSelections(): Selection[] {
-		return this._cursors.getViewSelections();
 	}
 
 	public getPosition(): Position {
@@ -538,7 +527,7 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 	// -----------------------------------------------------------------------------------------------------------
 	// ----- emitting events
 
-	private _emitStateChangedIfNecessary(source: string | null | undefined, reason: CursorChangeReason, oldState: CursorModelState | null): boolean {
+	private _emitStateChangedIfNecessary(source: string | null | undefined, reason: CursorChangeReason, oldState: CursorModelState | null, reachedMaxCursorCount: boolean): boolean {
 		const newState = new CursorModelState(this._model, this);
 		if (newState.equals(oldState)) {
 			return false;
@@ -557,7 +546,7 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 		) {
 			const oldSelections = oldState ? oldState.cursorState.map(s => s.modelState.selection) : null;
 			const oldModelVersionId = oldState ? oldState.modelVersionId : 0;
-			this._onDidChange.fire(new CursorStateChangedEvent(selections, newState.modelVersionId, oldSelections, oldModelVersionId, source || 'keyboard', reason));
+			this._onDidChange.fire(new CursorStateChangedEvent(selections, newState.modelVersionId, oldSelections, oldModelVersionId, source || 'keyboard', reason, reachedMaxCursorCount));
 		}
 
 		return true;
@@ -676,139 +665,109 @@ export class Cursor extends viewEvents.ViewEventEmitter implements ICursors {
 		}
 	}
 
-	public trigger(source: string | null | undefined, handlerId: string, payload: any): void {
-		const H = editorCommon.Handler;
-
-		if (handlerId === H.CompositionStart) {
-			this._isDoingComposition = true;
-			this._selectionsWhenCompositionStarted = this.getSelections().slice(0);
-			return;
-		}
-
-		if (handlerId === H.CompositionEnd) {
-			this._isDoingComposition = false;
-		}
-
+	private _executeEdit(callback: () => void, source: string | null | undefined, cursorChangeReason: CursorChangeReason = CursorChangeReason.NotSet): void {
 		if (this._configuration.options.get(EditorOption.readOnly)) {
-			// All the remaining handlers will try to edit the model,
-			// but we cannot edit when read only...
+			// we cannot edit when read only...
 			this._onDidAttemptReadOnlyEdit.fire(undefined);
 			return;
 		}
 
 		const oldState = new CursorModelState(this._model, this);
-		let cursorChangeReason = CursorChangeReason.NotSet;
-
 		this._cursors.stopTrackingSelections();
-
-		// ensure valid state on all cursors
-		this._cursors.ensureValidState();
-
 		this._isHandling = true;
 
 		try {
-			switch (handlerId) {
-				case H.Type:
-					this._type(source, <string>payload.text);
-					break;
-
-				case H.ReplacePreviousChar:
-					this._replacePreviousChar(<string>payload.text, <number>payload.replaceCharCnt);
-					break;
-
-				case H.Paste:
-					cursorChangeReason = CursorChangeReason.Paste;
-					this._paste(<string>payload.text, <boolean>payload.pasteOnNewLine, <string[]>payload.multicursorText || []);
-					break;
-
-				case H.Cut:
-					this._cut();
-					break;
-
-				case H.ExecuteCommand:
-					this._externalExecuteCommand(<editorCommon.ICommand>payload);
-					break;
-
-				case H.ExecuteCommands:
-					this._externalExecuteCommands(<editorCommon.ICommand[]>payload);
-					break;
-
-				case H.CompositionEnd:
-					this._interpretCompositionEnd(source);
-					break;
-			}
+			this._cursors.ensureValidState();
+			callback();
 		} catch (err) {
 			onUnexpectedError(err);
 		}
 
 		this._isHandling = false;
-
 		this._cursors.startTrackingSelections();
-
 		this._validateAutoClosedActions();
-
-		if (this._emitStateChangedIfNecessary(source, cursorChangeReason, oldState)) {
+		if (this._emitStateChangedIfNecessary(source, cursorChangeReason, oldState, false)) {
 			this._revealRange(source, RevealTarget.Primary, viewEvents.VerticalRevealType.Simple, true, editorCommon.ScrollType.Smooth);
 		}
 	}
 
-	private _interpretCompositionEnd(source: string | null | undefined) {
-		if (!this._isDoingComposition && source === 'keyboard') {
-			// composition finishes, let's check if we need to auto complete if necessary.
-			const autoClosedCharacters = AutoClosedAction.getAllAutoClosedCharacters(this._autoClosedActions);
-			this._executeEditOperation(TypeOperations.compositionEndWithInterceptors(this._prevEditOperationType, this.context.config, this.context.model, this._selectionsWhenCompositionStarted, this.getSelections(), autoClosedCharacters));
-			this._selectionsWhenCompositionStarted = null;
-		}
+	public startComposition(): void {
+		this._isDoingComposition = true;
+		this._selectionsWhenCompositionStarted = this.getSelections().slice(0);
 	}
 
-	private _type(source: string | null | undefined, text: string): void {
-		if (source === 'keyboard') {
-			// If this event is coming straight from the keyboard, look for electric characters and enter
-
-			const len = text.length;
-			let offset = 0;
-			while (offset < len) {
-				const charLength = strings.nextCharLength(text, offset);
-				const chr = text.substr(offset, charLength);
-
-				// Here we must interpret each typed character individually
+	public endComposition(source?: string | null | undefined): void {
+		this._isDoingComposition = false;
+		this._executeEdit(() => {
+			if (!this._isDoingComposition && source === 'keyboard') {
+				// composition finishes, let's check if we need to auto complete if necessary.
 				const autoClosedCharacters = AutoClosedAction.getAllAutoClosedCharacters(this._autoClosedActions);
-				this._executeEditOperation(TypeOperations.typeWithInterceptors(this._isDoingComposition, this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), autoClosedCharacters, chr));
-
-				offset += charLength;
+				this._executeEditOperation(TypeOperations.compositionEndWithInterceptors(this._prevEditOperationType, this.context.config, this.context.model, this._selectionsWhenCompositionStarted, this.getSelections(), autoClosedCharacters));
+				this._selectionsWhenCompositionStarted = null;
 			}
-
-		} else {
-			this._executeEditOperation(TypeOperations.typeWithoutInterceptors(this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), text));
-		}
+		}, source);
 	}
 
-	private _replacePreviousChar(text: string, replaceCharCnt: number): void {
-		this._executeEditOperation(TypeOperations.replacePreviousChar(this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), text, replaceCharCnt));
+	public type(text: string, source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			if (source === 'keyboard') {
+				// If this event is coming straight from the keyboard, look for electric characters and enter
+
+				const len = text.length;
+				let offset = 0;
+				while (offset < len) {
+					const charLength = strings.nextCharLength(text, offset);
+					const chr = text.substr(offset, charLength);
+
+					// Here we must interpret each typed character individually
+					const autoClosedCharacters = AutoClosedAction.getAllAutoClosedCharacters(this._autoClosedActions);
+					this._executeEditOperation(TypeOperations.typeWithInterceptors(this._isDoingComposition, this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), autoClosedCharacters, chr));
+
+					offset += charLength;
+				}
+
+			} else {
+				this._executeEditOperation(TypeOperations.typeWithoutInterceptors(this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), text));
+			}
+		}, source);
 	}
 
-	private _paste(text: string, pasteOnNewLine: boolean, multicursorText: string[]): void {
-		this._executeEditOperation(TypeOperations.paste(this.context.config, this.context.model, this.getSelections(), text, pasteOnNewLine, multicursorText));
+	public replacePreviousChar(text: string, replaceCharCnt: number, source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			this._executeEditOperation(TypeOperations.replacePreviousChar(this._prevEditOperationType, this.context.config, this.context.model, this.getSelections(), text, replaceCharCnt));
+		}, source);
 	}
 
-	private _cut(): void {
-		this._executeEditOperation(DeleteOperations.cut(this.context.config, this.context.model, this.getSelections()));
+	public paste(text: string, pasteOnNewLine: boolean, multicursorText?: string[] | null | undefined, source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			this._executeEditOperation(TypeOperations.paste(this.context.config, this.context.model, this.getSelections(), text, pasteOnNewLine, multicursorText || []));
+		}, source, CursorChangeReason.Paste);
 	}
 
-	private _externalExecuteCommand(command: editorCommon.ICommand): void {
-		this._cursors.killSecondaryCursors();
-
-		this._executeEditOperation(new EditOperationResult(EditOperationType.Other, [command], {
-			shouldPushStackElementBefore: false,
-			shouldPushStackElementAfter: false
-		}));
+	public cut(source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			this._executeEditOperation(DeleteOperations.cut(this.context.config, this.context.model, this.getSelections()));
+		}, source);
 	}
 
-	private _externalExecuteCommands(commands: editorCommon.ICommand[]): void {
-		this._executeEditOperation(new EditOperationResult(EditOperationType.Other, commands, {
-			shouldPushStackElementBefore: false,
-			shouldPushStackElementAfter: false
-		}));
+	public executeCommand(command: editorCommon.ICommand, source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			this._cursors.killSecondaryCursors();
+
+			this._executeEditOperation(new EditOperationResult(EditOperationType.Other, [command], {
+				shouldPushStackElementBefore: false,
+				shouldPushStackElementAfter: false
+			}));
+		}, source);
+	}
+
+	public executeCommands(commands: editorCommon.ICommand[], source?: string | null | undefined): void {
+		this._executeEdit(() => {
+			this._executeEditOperation(new EditOperationResult(EditOperationType.Other, commands, {
+				shouldPushStackElementBefore: false,
+				shouldPushStackElementAfter: false
+			}));
+		}, source);
 	}
 }
 

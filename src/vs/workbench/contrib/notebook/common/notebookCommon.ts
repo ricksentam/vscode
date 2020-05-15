@@ -16,6 +16,7 @@ import { IEditorModel } from 'vs/platform/editor/common/editor';
 import { NotebookTextModel } from 'vs/workbench/contrib/notebook/common/model/notebookTextModel';
 import { GlobPattern } from 'vs/workbench/api/common/extHost.protocol';
 import { CancellationToken } from 'vs/base/common/cancellation';
+import { Schemas } from 'vs/base/common/network';
 
 export enum CellKind {
 	Markdown = 1,
@@ -79,6 +80,7 @@ export enum NotebookCellRunState {
 export interface NotebookCellMetadata {
 	editable?: boolean;
 	runnable?: boolean;
+	breakpointMargin?: boolean;
 	executionOrder?: number;
 	statusMessage?: string;
 	runState?: NotebookCellRunState;
@@ -325,13 +327,12 @@ export interface NotebookDataDto {
 
 export namespace CellUri {
 
-	export const scheme = 'vscode-notebook';
+	export const scheme = 'vscode-notebook-cell';
 
 	export function generate(notebook: URI, handle: number): URI {
 		return notebook.with({
-			path: `${notebook.path}, cell ${handle + 1}`,
-			query: JSON.stringify({ cell: handle, notebook: notebook.toString() }),
 			scheme,
+			fragment: `${handle}${notebook.scheme !== Schemas.file ? notebook.scheme : ''}`
 		});
 	}
 
@@ -339,19 +340,17 @@ export namespace CellUri {
 		if (cell.scheme !== scheme) {
 			return undefined;
 		}
-		try {
-			const data = <{ cell: number, notebook: string }>JSON.parse(cell.query);
-			return {
-				handle: data.cell,
-				notebook: URI.parse(data.notebook)
-			};
-		} catch {
+		const handle = parseInt(cell.fragment);
+		if (isNaN(handle)) {
 			return undefined;
 		}
-	}
-
-	export function equal(a: URI, b: URI): boolean {
-		return a.path === b.path && a.query === b.query && a.scheme === b.scheme;
+		return {
+			handle,
+			notebook: cell.with({
+				scheme: cell.fragment.substr(handle.toString().length) || Schemas.file,
+				fragment: null
+			})
+		};
 	}
 }
 

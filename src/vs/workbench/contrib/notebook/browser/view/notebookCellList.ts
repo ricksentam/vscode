@@ -66,9 +66,15 @@ export class NotebookCellList extends WorkbenchList<CellViewModel> implements ID
 			});
 			this._previousFocusedElements = e.elements;
 
-			// Force focus out of webview if focus is in webview and I press an arrow key to focus the next cell
-			if (document.activeElement && document.activeElement.tagName.toLowerCase() === 'webview') {
-				this.focusView();
+			// if focus is in the list, but is not inside the focused element, then reset focus
+			if (DOM.isAncestor(document.activeElement, this.rowsContainer)) {
+				const focusedElement = this.getFocusedElements()[0];
+				if (focusedElement) {
+					const focusedDomElement = this.domElementOfElement(focusedElement);
+					if (focusedDomElement && !DOM.isAncestor(document.activeElement, focusedDomElement)) {
+						focusedDomElement.focus();
+					}
+				}
 			}
 		}));
 
@@ -396,6 +402,10 @@ export class NotebookCellList extends WorkbenchList<CellViewModel> implements ID
 	}
 
 	setFocus(indexes: number[], browserEvent?: UIEvent): void {
+		if (!indexes.length) {
+			return;
+		}
+
 		if (this._viewModel) {
 			this._viewModel.selectionHandles = indexes.map(index => this.element(index)).map(cell => cell.handle);
 		}
